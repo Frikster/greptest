@@ -3,11 +3,51 @@ from pydantic import BaseModel, validator
 import requests
 import re
 from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+
+# from fastapi import Depends
+# import json
 
 app = FastAPI()
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to your needs
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 REMOTE = "github"
 GITHUB_API_URL = "https://api.github.com"
+
+PROMPT = """
+Investigate the codebase and write unit tests for the project for files where you have identified it would be important to have unit tests and they are missing.
+
+Return ONLY a response in JSON format with the following schema:
+{
+    "fileChanges": [
+        {
+            "filePath": "path/to/file.test.ext",
+            "newContent": "file.test.ext content with new content you have added"
+        }
+    ]
+}
+
+IT MUST BE RETURNED AS A VALID JSON IN THE FORMAT ABOVE - DO NOT RETURN ANY OTHER TEXT
+
+Note that you CAN create new files. Therefore filePath can point to a file that does not exist.
+Use your understanding of the codebase structure to determine where new files should be created.
+You should however prefer to modify existing files if you find files that already have unit tests.
+In such cases you should look for missing edge cases.
+
+The project may use different technology stacks. Identify the stack used in the repository and use appropriate testing frameworks and libraries for writing the tests. For example:
+- For a Next.js project using TypeScript, use Jest and React Testing Library.
+- For a Python project, use unittest or pytest.
+- For a Java project, use JUnit.
+
+Do note that you can include multiple files and contents in your response.
+"""
 
 def validate_github_repo(v: str) -> str:
     if not re.match(r'^[^/]+/[^/]+$', v):
@@ -21,46 +61,36 @@ def github_headers(token: str) -> dict:
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-class RepoIndexRequest(BaseModel):
-    apiKey: str
+class BaseRequest(BaseModel):
     githubToken: str
     githubRepo: str
     githubBranch: str
-
     _validate_github_repo = validator('githubRepo', allow_reuse=True)(validate_github_repo)
 
-class CreatePRRequest(BaseModel):
-    githubToken: str
-    githubRepo: str
-    baseBranch: str
-    headBranch: str
-    title: str
-    body: str
-
-    _validate_github_repo = validator('githubRepo', allow_reuse=True)(validate_github_repo)
-
-class QueryCodeRequest(BaseModel):
+class RepoIndexRequest(BaseRequest):
     apiKey: str
-    githubToken: str
-    githubRepo: str
-    githubBranch: str
-    query: str
 
-    _validate_github_repo = validator('githubRepo', allow_reuse=True)(validate_github_repo)
+class QueryCodeRequest(BaseRequest):
+    apiKey: str
 
 class FileChange(BaseModel):
     filePath: str
     newContent: str
 
-class ModifyRepoRequest(BaseModel):
-    githubToken: str
-    githubRepo: str
-    baseBranch: str
+class ModifyRepoRequest(BaseRequest):
     newBranch: str
     commitMessage: str
     fileChanges: List[FileChange]
 
-    _validate_github_repo = validator('githubRepo', allow_reuse=True)(validate_github_repo)
+class CreatePRRequest(BaseRequest):
+    headBranch: str
+    title: str
+    body: str
+
+# class CombinedRequest(BaseModel):
+#     query_request: QueryCodeRequest
+#     modify_request: ModifyRepoRequest
+#     create_pr_request: CreatePRRequest
 
 @app.post("/index-repo")
 async def index_repo(request: RepoIndexRequest):
@@ -95,7 +125,7 @@ async def query_code(request: QueryCodeRequest):
         "messages": [
             {
                 "id": "1",
-                "content": request.query,
+                "content": PROMPT,
                 "role": "user"
             }
         ],
@@ -106,10 +136,10 @@ async def query_code(request: QueryCodeRequest):
                 "repository": request.githubRepo
             }
         ],
+        "genius": True
         # TODO: use below three params?
         # "sessionId": request.sessionId,
         # "stream": True,
-        # "genius": True
     }
     headers = {
         "Authorization": f"Bearer {request.apiKey}",
@@ -130,7 +160,7 @@ async def query_code(request: QueryCodeRequest):
 @app.post("/modify-repo")
 async def modify_repo(request: ModifyRepoRequest):
     # get base sha
-    url = f"{GITHUB_API_URL}/repos/{request.githubRepo}/git/refs/heads/{request.baseBranch}"
+    url = f"{GITHUB_API_URL}/repos/{request.githubRepo}/git/refs/heads/{request.githubBranch}"
     response = requests.get(url, headers=github_headers(request.githubToken))
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=response.json())
@@ -197,7 +227,7 @@ async def create_pr(request: CreatePRRequest):
         "title": request.title,
         "body": request.body,
         "head": request.headBranch,
-        "base": request.baseBranch
+        "base": request.githubBranch
     }
     response = requests.post(
         url,
@@ -209,6 +239,25 @@ async def create_pr(request: CreatePRRequest):
         raise HTTPException(status_code=response.status_code, detail=response.json())
 
     return response.json()
+
+# @app.post("/query-and-modify-repo-and-create-pr")
+# async def query_and_modify_repo_and_create_pr(request: CombinedRequest):
+#     # Call query_code and get the result
+#     query_result = await query_code(request.query_request)
+
+#     # Extract file changes from the query result
+#     file_changes_str = query_result.message.get("fileChanges", [])  # TODO: add error handling
+#     json_file_changes = json.loads(file_changes_str)
+#     request.modify_request.fileChanges = [FileChange(**fc) for fc in json_file_changes]
+
+#     # Call modify_repo with the updated modify_request
+#     await modify_repo(request.modify_request)
+
+#     # Call create_pr now that we have the new branch
+#     create_pr_result = await create_pr(request.create_pr_request)
+
+#     return create_pr_result
+
 
 if __name__ == '__main__':
     import uvicorn
